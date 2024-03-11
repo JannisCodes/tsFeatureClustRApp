@@ -1,0 +1,475 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+#| label: setup
+#| include: FALSE
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE) 
+
+run_analyses <- FALSE
+
+```
+
+## Import data
+
+```{r}
+#| label: data-import 
+
+load("data/features.RData")
+
+```
+
+### Parameters to create the parameter space
+
+-   *Data: raw vs normalized features (maybe)*
+
+-   Dimension Reduction: PCA, t-SNE
+
+-   Clustering: k-means, DBSCAN, hclust
+
+-   Parameters:
+
+    -   PCA: Number of components
+
+    -   t-SNE: Perplexity levels
+
+    -   k-means: Number of clusters (k)
+
+    -   DBSCAN: **`eps`** and **`minPts`**
+
+    -   hclust: Linkage methods (e.g., "ward.D2", "average")
+
+## Run Models
+
+### Parameter Space
+
+```{r}
+#| label: parameters
+
+library(dplyr)
+library(tidyr)
+
+# Method-parameter mapping
+dim_red_method_parameters <- list(
+  None = character(0),
+  PCA = c("n_components"),
+  tSNE = c("perplexity"),
+  Autoencoder = c("encoding_dim", "epochs"),
+  UMAP = c("n_components", "n_neighbors", "min_dist")
+)
+
+cluster_method_parameters <- list(
+  kmeans = c("k"),
+  DBSCAN = c("eps", "minPts"),
+  hclust = c("k", "linkage")
+)
+#combined
+method_parameter_map <- c(
+  dim_red_method_parameters,
+  cluster_method_parameters
+)
+
+# definition of parameter values
+params_values <- list(
+  n_components = c(2, 3, 5, 10, 15, 20, 25, 27, 30, 35),  # For PCA and UMAP
+  perplexity = c(5, 10, 20, 30, 40, 50),  # For t-SNE
+  encoding_dim = c(8, 16, 24, 32, 48, 64),  # For Autoencoder
+  epochs = c(50, 100, 150, 200),  # For Autoencoder, training epochs
+  n_neighbors = c(5, 10, 15, 20, 30),  # For UMAP
+  min_dist = c(0.1, 0.25, 0.5, 0.75),  # For UMAP
+  k = c(2, 3, 4, 5, 6, 7, 8, 9, 10),  # For k-means and hclust
+  eps = c(0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2),  # For DBSCAN
+  minPts = c(2, 3, 4, 5),  # For DBSCAN
+  linkage = c("ward.D2", "average", "single", "complete")  # For hclust
+)
+
+# Generate combinations of dim_red_method and cluster_method
+combinations <- expand.grid(dim_red_method = names(dim_red_method_parameters),
+                            cluster_method = names(cluster_method_parameters),
+                            stringsAsFactors = FALSE)
+
+# Function to generate a tibble for a given combination with all parameters properly named
+generate_param_tibble <- function(dim_red_method, cluster_method, params_values) {
+  dim_red_params <- dim_red_method_parameters[[dim_red_method]]
+  cluster_params <- cluster_method_parameters[[cluster_method]]
+  
+  # Extract relevant parameters for the current combination
+  relevant_params_values <- params_values[names(params_values) %in% c(dim_red_params, cluster_params)]
+  
+  # Generate the parameter grid for the current combination
+  param_grid <- expand.grid(relevant_params_values, stringsAsFactors = FALSE)
+  
+  # Add columns for dim_red_method and cluster_method
+  param_grid$dim_red_method <- dim_red_method
+  param_grid$cluster_method <- cluster_method
+  
+  return(param_grid)
+}
+
+# Generate parameter tibbles for each combination and combine them into a single tibble
+param_grids_tibble <- bind_rows(lapply(1:nrow(combinations), function(i) {
+  generate_param_tibble(combinations$dim_red_method[i], combinations$cluster_method[i], params_values)
+}))
+
+# Convert to tibble for nicer formatting (optional)
+param_grid <- as_tibble(param_grids_tibble) %>%
+  select(
+    dim_red_method,
+    cluster_method,
+    everything()
+  )
+
+save(param_grid, file="data/param_grid.Rda")
+```
+
+### Preparing performance function
+
+```{r}
+library(Rtsne)
+library(dbscan)
+library(cluster)
+library(keras)  # For Autoencoder
+library(uwot)   # For UMAP
+
+# AUTOENCODER FUNCTIONS:
+create_autoencoder_model <- function(input_dim, encoding_dim) {
+  input_layer <- layer_input(shape = input_dim)
+  
+  # Encoder
+  encoded <- input_layer %>%
+    layer_dense(units = encoding_dim, activation = 'relu')
+  
+  # Decoder
+  decoded <- encoded %>%
+    layer_dense(units = input_dim, activation = 'sigmoid')
+  
+  # Autoencoder model
+  autoencoder <- keras_model(input = input_layer, output = decoded)
+  
+  # Compile the autoencoder
+  autoencoder %>% compile(
+    optimizer = 'adam',
+    loss = 'binary_crossentropy'
+  )
+  
+  return(autoencoder)
+}
+
+autoencoder_get_encoder <- function(autoencoder) {
+  encoder_input <- autoencoder$input
+  # access the second layer (first hidden layer after input) with integer index
+  encoder_output <- autoencoder$get_layer(index = as.integer(1))$output
+  
+  encoder_model <- keras_model(inputs = encoder_input, outputs = encoder_output)
+  
+  return(encoder_model)
+}
+
+
+
+perform_clustering <- function(data, dim_red_method, cluster_method, params) {
+  # data <- scaled_data
+  # dim_red_method <- params$dim_red_method
+  # cluster_method <- params$cluster_method
+  # params <- params 
+  
+  data_matrix <- as.matrix(data)
+  
+  # Initialize variables to store results
+  data_reduced <- NULL
+  cluster_res <- NULL
+  
+  # Apply dimension reduction based on method
+  if (dim_red_method == "PCA") {
+    if (!is.na(params$n_components)) {
+      pca_res <- prcomp(data, scale. = TRUE)
+      data_reduced <- predict(pca_res)[, 1:params$n_components]
+    }
+  } else if (dim_red_method == "tSNE") {
+    if (!is.na(params$perplexity)) {
+      set.seed(42)  # For reproducibility
+      tsne_res <- Rtsne(data, dims = 2, perplexity = params$perplexity, pca = FALSE, verbose = FALSE)
+      data_reduced <- tsne_res$Y
+    }
+  } else if (dim_red_method == "Autoencoder") {
+    if (!is.na(params$encoding_dim)) {
+      # Ensure your autoencoder model is appropriately defined for `params$encoding_dim`
+      autoencoder <- create_autoencoder_model(ncol(data_matrix), params$encoding_dim) 
+      autoencoder %>% fit(
+        x = data_matrix, 
+        y = data_matrix, 
+        epochs = params$epochs, 
+        batch_size = 256, 
+        validation_split = 0.2,
+        verbose = 0
+      )
+      encoder <- autoencoder_get_encoder(autoencoder) 
+      data_reduced <- predict(encoder, data_matrix)
+    }
+  } else if (dim_red_method == "UMAP") {
+    if (!is.na(params$n_components) && !is.na(params$n_neighbors) && !is.na(params$min_dist)) {
+      set.seed(42)  # For reproducibility
+      umap_res <- umap(data, n_neighbors = params$n_neighbors, min_dist = params$min_dist, n_components = params$n_components, metric = "euclidean")
+      data_reduced <- umap_res
+    }
+  } else if (dim_red_method == "None") {
+    # Skip dimension reduction, use original data
+    data_reduced <- data_matrix
+  }
+  
+  # Check if dimension reduction was successful
+  if (!is.null(data_reduced)) {
+    # Apply clustering based on method
+    if (cluster_method == "kmeans") {
+      if (!is.na(params$k)) {
+        set.seed(42)
+        cluster_res <- kmeans(data_reduced, centers = params$k)
+      }
+    } else if (cluster_method == "DBSCAN") {
+      if (!is.na(params$eps) && !is.na(params$minPts)) {
+        cluster_res <- dbscan(data_reduced, eps = params$eps, minPts = params$minPts)
+      }
+    } else if (cluster_method == "hclust") {
+      if (!is.na(params$k) && !is.na(params$linkage)) {
+        d <- dist(data_reduced)
+        hc <- hclust(d, method = params$linkage)
+        cluster_res <- cutree(hc, k = params$k)
+      }
+    }
+  }
+  
+  # Return list containing reduced data and clustering results
+  return(list(data_reduced = data_reduced, cluster_res = cluster_res))
+}
+
+```
+
+### **Iterating Over Combinations**
+
+```{r, eval = run_analyses}
+#| label: run-analysis
+
+library(progress)
+library(tibble)
+
+# Create a progress bar
+pb <- progress_bar$new(
+  format = "[:bar] :percent :eta",
+  total = nrow(param_grid),
+  clear = FALSE,  # Set to TRUE if you want the progress bar to disappear after completion
+  width = 60
+)
+
+# Initialize an empty tibble for results
+results_df <- tibble()
+
+for (i in 1:nrow(param_grid)) {
+  params <- param_grid[i, ]
+
+  # Perform clustering with current parameters
+  clustering_output <- perform_clustering(scaled_data, params$dim_red_method, params$cluster_method, params)
+
+  # Convert results to a tibble/data frame row
+  result_row <- tibble(
+    dim_red_method = params$dim_red_method,
+    cluster_method = params$cluster_method,
+    n_components = params$n_components,
+    perplexity = params$perplexity,
+    encoding_dim = params$encoding_dim,
+    epochs = params$epochs,
+    n_neighbors = params$n_neighbors,
+    min_dist = params$min_dist,
+    k = params$k,
+    eps = params$eps,
+    minPts = params$minPts,
+    linkage = params$linkage,
+    result = list(clustering_output) # Store complex results as list-columns
+  )
+
+  # Bind the row to the results data frame
+  results_df <- bind_rows(results_df, result_row)
+  
+  # Update the progress bar
+  pb$tick()
+}
+```
+
+### **Evaluate and Compare Results**
+
+```{r}
+library(purrr)
+library(cluster)  # For silhouette
+library(fpc)  # For DBSCAN evaluation
+
+evaluate_results <- function(clustering_output, data_reduced) {
+  # clustering_output <- results_df$result[[82]]
+  # data_reduced <- results_df$result[[82]]$data_reduced
+
+  
+  # Check for valid data_reduced
+  if (is.null(data_reduced) || nrow(data_reduced) < 2) {
+    warning("data_reduced is NULL or has fewer than 2 rows. Cannot compute silhouette scores.")
+    return(NA)  # Cannot compute silhouette scores
+  }
+  
+  # Compute distance matrix
+  dist_matrix <- as.matrix(dist(data_reduced))
+  
+  scores <- NULL  # Initialize scores
+  
+  if (inherits(clustering_output$cluster_res, "kmeans")) {
+    silhouette_output <- silhouette(clustering_output$cluster_res$cluster, dist_matrix)
+    if (!is.null(silhouette_output) && is.matrix(silhouette_output) && dim(silhouette_output)[2] >= 2) {
+      scores <- silhouette_output[, "sil_width"]
+    } else {
+      warning("Silhouette output for kmeans is not in the expected matrix format or lacks 'sil_width' column.")
+    }
+  } else if (inherits(clustering_output$cluster_res, "dbscan")) {
+    # Exclude noise points (cluster == 0) for DBSCAN
+    valid_clusters <- clustering_output$cluster_res$cluster > 0
+    if (sum(valid_clusters) > 1) {
+      silhouette_output <- silhouette(clustering_output$cluster_res$cluster[valid_clusters], dist_matrix[valid_clusters, valid_clusters])
+      if (!is.null(silhouette_output) && is.matrix(silhouette_output) && dim(silhouette_output)[2] >= 2) {
+        scores <- silhouette_output[, "sil_width"]
+      } else {
+        warning("Silhouette output for DBSCAN is not in the expected matrix format or lacks 'sil_width' column.")
+      }
+    } else {
+      warning("DBSCAN has all points as noise or only one valid cluster. Cannot compute silhouette scores.")
+      return(NA)
+    }
+  } else {
+    # Generic handling for other clustering results
+    silhouette_output <- silhouette(as.integer(clustering_output$cluster_res), dist_matrix)
+    if (!is.null(silhouette_output) && is.matrix(silhouette_output) && dim(silhouette_output)[2] >= 2) {
+      scores <- silhouette_output[, "sil_width"]
+    } else {
+      warning("Silhouette output for hclust or similar is not in the expected matrix format or lacks 'sil_width' column.")
+    }
+  }
+
+  # Check if scores is NA or has valid silhouette widths
+  if (is.null(scores) || length(scores) == 0) {
+    warning("No valid silhouette scores were computed.")
+    return(NA)  # Return NA if no valid scores were computed
+  } else {
+    return(mean(scores, na.rm = TRUE))  # Compute mean silhouette width
+  }
+}
+# Function to create parameter strings for dimension reduction methods and clustering algorithms
+create_param_string <- function(method, params) {
+  relevant_params <- method_parameter_map[[method]]
+  param_values <- sapply(relevant_params, function(p) {
+    param_value <- params[[p]]
+    if (!is.na(param_value)) {
+      return(paste0(p, "=", param_value))
+    } else {
+      return(NULL)
+    }
+  })
+  # paste(method, param_values, collapse = "_")
+  paste(param_values, collapse = "_")
+}
+
+
+results_df2 <- results_df %>%
+  mutate(silhouette_score = map_dbl(result, ~evaluate_results(.x, .x$data_reduced))) %>%
+  rowwise() %>%
+  mutate(DimRedMethod_Parameters = create_param_string(dim_red_method, cur_data()),
+         ClusterMethod_Parameters = create_param_string(cluster_method, cur_data()))
+
+# Print the tibble with added silhouette scores
+print(results_df2)
+
+# Find the best model(s) based on silhouette scores
+best_model <- results_df2 %>%
+  filter(silhouette_score == max(silhouette_score, na.rm = TRUE))
+
+# Print best model
+print(best_model)
+
+```
+
+```{r}
+# save grid and results
+
+results_df3 <- results_df2 %>%
+  rowwise() %>%
+  mutate(unique_id = paste(
+    dim_red_method, 
+    gsub("_", "", DimRedMethod_Parameters), 
+    cluster_method, 
+    gsub("_", "", ClusterMethod_Parameters), 
+    sep = "_"
+  )) %>%
+  mutate(unique_id = gsub("^_|_$", "", unique_id),  # Remove leading/trailing underscores
+         unique_id = gsub("=", "", unique_id),  # Remove equal signs
+         unique_id = gsub("__+", "_", unique_id)) %>%  # Replace multiple underscores with a single one
+  ungroup() %>%
+  arrange(unique_id) %>%
+  mutate(numeric_id = row_number()) %>%
+  select(
+    numeric_id, unique_id, everything()
+  )
+
+save(results_df, file="data/results_df.Rda")
+save(results_df2, file="data/results_df2.Rda")
+save(results_df3, file="data/results_df3.Rda")
+
+performance <- results_df3 %>%
+  select(-result)
+
+fst::write_fst(performance, "data/performance.fst")
+
+```
+
+### inspection
+
+```{r}
+
+library(ggplot2)
+library(forcats)
+
+# Preprocess heatmap data for improved visualization
+heatmap_data <- results_df2 %>%
+  select(dim_red_method, cluster_method, DimRedMethod_Parameters, ClusterMethod_Parameters, silhouette_score) %>%
+  ungroup() %>%
+  group_by(dim_red_method, cluster_method) %>%
+  mutate(has_scores = any(!is.na(silhouette_score)), # Check if there are any non-NA scores
+         max_score = if_else(has_scores, silhouette_score == max(silhouette_score, na.rm = TRUE), FALSE),
+         min_score = if_else(has_scores, silhouette_score == min(silhouette_score, na.rm = TRUE), FALSE)) %>%
+  ungroup()
+
+
+# Improved Heatmap Visualization
+ggplot(heatmap_data, aes(x = ClusterMethod_Parameters, y = DimRedMethod_Parameters)) +
+  geom_tile(aes(fill = silhouette_score), color = "white") + # Base layer for all tiles
+  geom_tile(data = filter(heatmap_data, max_score), fill = "gold", color = "white") + # Highlight max scores
+  geom_tile(data = filter(heatmap_data, min_score), fill = "lightblue", color = "white") + # Highlight min scores
+  geom_text(aes(label = sprintf("%.2f", silhouette_score)), size = 2.5, color = "black", check_overlap = TRUE) + # Add text labels
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = median(heatmap_data$silhouette_score, na.rm = TRUE), space = "Lab", name = "Silhouette\nScore") +
+  facet_grid(dim_red_method ~ cluster_method, scales = "free", space = "free") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6, vjust = 0.5),
+        axis.text.y = element_text(size = 6),
+        axis.title = element_text(size = 14),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 10),
+        strip.background = element_rect(fill = "lightblue"),
+        strip.text = element_text(size = 9)) +
+  labs(x = "Clustering Algorithm with Parameters", 
+       y = "Dimension Reduction Method with Parameters", 
+       title = "Silhouette Scores by Dimension Reduction and Clustering Methods",
+       subtitle = "Higher scores indicate better cluster separation, with max/min highlighted")
+
+
+
+```
+
+```{r}
+
+```
